@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+  <arg name="imu_topic" default="/imu"/>
+  <arg name="imu_rate" default="100"/>
+  <arg name="measure_rate" default="100"/>
+
+  <arg name="path_bag" default="$(find-pkg-share allan_variance_ros)/bag/chao_imu.db3"/>
+  <arg name="bag_start" default="0"/>
+  <arg name="bag_durr" default="-1"/>
+
+  <arg name="output_file" default="allan_variance.csv"/>
+
+  <node pkg="allan_variance_ros" exec="allan_variance_ros_node" name="allan_variance_ros_node" output="screen">
+    <param name="imu_topic" value="$(var imu_topic)"/>
+    <param name="imu_rate" value="$(var imu_rate)"/>
+    <param name="measure_rate" value="$(var measure_rate)"/>
+    <param name="path_bag" value="$(var path_bag)"/>
+    <param name="bag_start" value="$(var bag_start)"/>
+    <param name="bag_durr" value="$(var bag_durr)"/>
+    <param name="output_file" value="$(var output_file)"/>
+  </node>
+</launch>

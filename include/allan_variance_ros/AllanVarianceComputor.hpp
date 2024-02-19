@@ -1,93 +1,82 @@
-#pragma once
+#ifndef ALLAN_VARIANCE_ROS_ALLANVARIANCECOMPUTOR_H
+#define ALLAN_VARIANCE_ROS_ALLANVARIANCECOMPUTOR_H
 
-// ROS
-#include <ros/node_handle.h>
-#include <rosbag/bag.h>
-#include <rosbag/query.h>
-#include <rosbag/view.h>
-#include <sensor_msgs/Imu.h>
+#include <rclcpp/rclcpp.hpp>
+#include <rclcpp/serialization.hpp>
+#include <rosbag2_cpp/reader.hpp>
+#include <rcutils/time.h>
+#include <sensor_msgs/msg/imu.hpp>
 
-#include <mutex>
+#include <Eigen/Core>
 
-// allan_variance_ros
-#include "allan_variance_ros/ImuMeasurement.hpp"
-#include "allan_variance_ros/yaml_parsers.hpp"
+#include <string>
+#include <vector>
+#include <fstream>
 
-namespace allan_variance_ros {
+namespace allan_variance_ros
+{
 
-template <class T>
-using EigenVector = std::vector<T, Eigen::aligned_allocator<T>>;
+class AllanVarianceComputor : public rclcpp::Node
+{
+public:
 
-uint64_t s2ns(double t) { return static_cast<uint64_t>(t * 1000000000); }
-double ns2s(uint64_t t) { return static_cast<double>(t * 0.000000001); }
+  template <class T>
+  using EigenVector = std::vector<T, Eigen::aligned_allocator<T>>;
 
-struct ImuFormat {
-  double time;
-  double accX;
-  double accY;
-  double accZ;
-  double gyroX;
-  double gyroY;
-  double gyroZ;
-  double qx;
-  double qy;
-  double qz;
-  double qw;
+  AllanVarianceComputor(const std::string & node_name);
 
-  void writeOnFile(std::ofstream& file) {
-    file << std::setprecision(19) << time << std::setprecision(7) << " " << accX << " " << accY << " " << accZ << " "
-         << gyroX << " " << gyroY << " " << gyroZ << " " << qx << " " << qy << " " << qz << " " << qw << std::endl;
+  virtual ~AllanVarianceComputor() = default;
+
+private:
+
+  struct ImuMeasurement
+  {
+  public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    // ROS time message received (nanoseconds).
+    uint64_t t;
+
+    // Raw acceleration from the IMU (m/s/s)
+    Eigen::Vector3d I_a_WI;
+
+    // Raw angular velocity from the IMU (deg/s)
+    Eigen::Vector3d I_w_WI;
+  };
+
+  template <typename T>
+  double stamp2NanoSec(const T & stamp)
+  {
+    return RCUTILS_S_TO_NS(rclcpp::Time(stamp).seconds());
   }
-};
 
-struct AllanVarianceFormat {
-  double period;
-  double accX;
-  double accY;
-  double accZ;
-  double gyroX;
-  double gyroY;
-  double gyroZ;
+  void allanVariance(const EigenVector<ImuMeasurement> & imuBuffer);
 
-  void writeOnFile(std::ofstream& file) {
-    file << std::setprecision(19) << period << std::setprecision(7) << " " << accX << " " << accY << " " << accZ << " "
-         << gyroX << " " << gyroY << " " << gyroZ << " " << std::endl;
-  }
-};
+  void writeAllanDeviation(const std::vector<double> & variance, double period);
 
-class AllanVarianceComputor {
- public:
-  AllanVarianceComputor(ros::NodeHandle& nh, std::string config_file, std::string output_path);
+private:
 
-  virtual ~AllanVarianceComputor() {closeOutputs();}
+  std::ofstream av_output_;
 
-  void run(std::string bag_path);
-  void closeOutputs();
-  void allanVariance();
-  void writeAllanDeviation(std::vector<double> variance, double period);
+  rosbag2_cpp::Reader reader_;
 
- private:
-  // ROS
-  ros::NodeHandle& nh_;
+  rclcpp::Serialization<sensor_msgs::msg::Imu> imu_serialization_;
+
+  std::string imu_topic_;
+
+  /// Location of the ROS bag we want to read in
+  std::string path_to_bag_;
+
+  /// Get our start location and how much of the bag we want to play
+  /// Make the bag duration < 0 to just process to the end of the bag
+  double bag_start_, bag_durr_;
+
+  // Percent to overlap bins
+  double overlap_;
 
   // Data
-  AllanVarianceFormat aVRecorder_{};
-  std::ofstream av_output_;
-  std::string imu_output_file_;
-
-  // Config
-  int sequence_time_{};
-  int measure_rate_{};
-  std::vector<std::string> input_topics_;
-  double imu_rate_ = 100.0;
-
-  int skipped_imu_{};
-  int imu_skip_;
-  uint64_t tCurrNanoSeconds_{};
-  uint64_t lastImuTime_{};
-  uint64_t firstTime_{};
-  EigenVector<ImuMeasurement> imuBuffer_;
-  bool firstMsg_;
-  float overlap_; // Percent to overlap bins
+  int imu_rate_ = 100;
 };
 }  // namespace allan_variance_ros
+
+#endif // ALLAN_VARIANCE_ROS_ALLANVARIANCECOMPUTOR_H

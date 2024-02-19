@@ -1,0 +1,8 @@
+#Accelerometer
+accelerometer_noise_density: 0.003075146601664115 
+accelerometer_random_walk: 0.00023564280559096592 
+
+#Gyroscope
+gyroscope_noise_density: 0.00013108142177250273 
+gyroscope_random_walk: 1.9869768875891635e-07 
+

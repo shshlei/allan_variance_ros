@@ -1,130 +1,71 @@
-
 #include "allan_variance_ros/AllanVarianceComputor.hpp"
 
-namespace allan_variance_ros {
+#include <mutex>
+#include <map>
+#include <memory>
+#include <iomanip>
+#include <iostream>
 
-AllanVarianceComputor::AllanVarianceComputor(ros::NodeHandle& nh, std::string config_file, std::string output_path)
-    : nh_(nh), firstMsg_(true), overlap_(0.0) {
-  YAML::Node node = loadYamlFile(config_file);
+namespace allan_variance_ros
+{
 
-  std::string imu_topic;
+AllanVarianceComputor::AllanVarianceComputor(const std::string & node_name) : Node(node_name), overlap_(0.0)
+{
+  imu_topic_ = declare_parameter("imu_topic", "/imu");
+  imu_rate_ = declare_parameter("imu_rate", 100);
+  RCLCPP_INFO_STREAM(get_logger(), "imu_topic: " << imu_topic_);
+  RCLCPP_INFO_STREAM(get_logger(), "imu_rate: " << imu_rate_);
 
-  get(node, "imu_topic", imu_topic);
-  ROS_INFO_STREAM("imu_topic: " << imu_topic);
-  get(node, "imu_rate", imu_rate_);
-  ROS_INFO_STREAM("imu_rate: " << imu_rate_);
-  get(node, "measure_rate", measure_rate_);
-  ROS_INFO_STREAM("measure_rate: " << measure_rate_);
-  get(node, "sequence_time", sequence_time_);
-  ROS_INFO_STREAM("sequence_time: " << sequence_time_);
+  path_to_bag_ = declare_parameter("path_bag", "");
+  bag_start_ = declare_parameter("bag_start_", 0);
+  bag_durr_ = declare_parameter("bag_durr_", -1);
 
-  input_topics_.push_back(imu_topic);
+  // Read Data
+  reader_.open(path_to_bag_);
+  const rosbag2_storage::BagMetadata & mdata = reader_.get_metadata();
+  rcutils_time_point_value_t start = mdata.starting_time.time_since_epoch().count() + RCUTILS_S_TO_NS(bag_start_);
+  reader_.seek(start);
+  rcutils_time_point_value_t end = start;
+  if (bag_durr_ > 0) end = start + RCUTILS_S_TO_NS(bag_durr_);
 
-  imu_skip_ = int(imu_rate_ / measure_rate_);
+  EigenVector<ImuMeasurement> imuBuffer;
+  RCLCPP_INFO_STREAM(get_logger(), "Processing " << path_to_bag_ << " ...");
+  while (reader_.has_next()) {
+    rosbag2_storage::SerializedBagMessageSharedPtr msg = reader_.read_next();
+    if (msg->topic_name != imu_topic_) continue;
+    if (bag_durr_ > 0 && msg->time_stamp > end) break;
 
-  imu_output_file_ = output_path + "/" + "allan_variance" + ".csv";
-}
+    // Subsample IMU measurements
+    rclcpp::SerializedMessage serialized_msg(*msg->serialized_data);
+    sensor_msgs::msg::Imu::SharedPtr s_imu = std::make_shared<sensor_msgs::msg::Imu>();
+    imu_serialization_.deserialize_message(&serialized_msg, s_imu.get());
 
-// write_imu_only assumes batch optimization and that an optimization run had already happened
-void AllanVarianceComputor::run(std::string bag_path) {
-  ROS_INFO_STREAM("Processing " << bag_path << " ...");
-
-  av_output_ = std::ofstream(imu_output_file_.c_str(), std::ofstream::out);
-
-  int imu_counter = 0;
-
-  try {
-    rosbag::Bag bag;
-    bag.open(bag_path, rosbag::bagmode::Read);
-    rosbag::View view(bag, rosbag::TopicQuery(input_topics_));
-
-
-    // Check to make sure we have data to play
-    if (view.size() == 0) {
-      ROS_ERROR_STREAM("Unable to parse any messages...");
-      return;
-    }
-    ROS_INFO_STREAM("Bag has " << view.size() << " messages, parsing...");
-
-    // Loop through data
-    time_t start = clock();
-    for (const rosbag::MessageInstance &msg : view) {
-      // Fill IMU buffer
-      if (msg.isType<sensor_msgs::Imu>()) {
-        sensor_msgs::ImuConstPtr imu_msg = msg.instantiate<sensor_msgs::Imu>();
-        tCurrNanoSeconds_ = imu_msg->header.stamp.toNSec();
-
-        imu_counter++;
-
-        // Subsample IMU measurements
-        if (imu_counter % imu_skip_ != 0 || imu_counter / imu_rate_ > sequence_time_) {
-          continue;
-        }
-
-        if (difftime(clock(), start) / CLOCKS_PER_SEC >= 2.0) {
-          ROS_INFO_STREAM(imu_counter / imu_rate_ << " / " << sequence_time_ << " seconds loaded");
-          start = clock();
-        }
-
-        if (firstMsg_) {
-          firstMsg_ = false;
-          firstTime_ = tCurrNanoSeconds_;
-          lastImuTime_ = tCurrNanoSeconds_;
-        }
-
-        if (tCurrNanoSeconds_ < lastImuTime_) {
-          skipped_imu_++;
-          ROS_ERROR_STREAM("IMU out of order. Current(ns): "
-                           << tCurrNanoSeconds_ - firstTime_ << " Last(ns): "
-                           << lastImuTime_ - firstTime_ << " (" << skipped_imu_ << " dropped)");
-          continue;
-        }
-        lastImuTime_ = tCurrNanoSeconds_;
-
-        ImuMeasurement input;
-        input.t = imu_msg->header.stamp.toNSec();
-        input.I_a_WI = Eigen::Vector3d(imu_msg->linear_acceleration.x, imu_msg->linear_acceleration.y,
-                                       imu_msg->linear_acceleration.z);
-        input.I_w_WI =
-            Eigen::Vector3d(imu_msg->angular_velocity.x, imu_msg->angular_velocity.y, imu_msg->angular_velocity.z);
-
-        imuBuffer_.push_back(input);
-      }
-      if (!nh_.ok()) {
-        ROS_ERROR_STREAM("Stop requested, closing the bag!");
-        bag.close();
-        return;
-      }
-    }
-    bag.close();
-
-  } catch (rosbag::BagIOException &e) {
-    ROS_WARN_STREAM("Captured rosbag::BagIOException " << e.what());
-  } catch (rosbag::BagUnindexedException &e) {
-    ROS_WARN_STREAM("Captured rosbag::BagUnindexedException " << e.what());
-  } catch (std::exception &e) {
-    ROS_ERROR_STREAM(e.what());
-  } catch (...) {
-    ROS_ERROR("Captured unknown exception");
+    double time_imu = stamp2NanoSec(s_imu->header.stamp);
+    ImuMeasurement input;
+    input.t = time_imu;
+    input.I_a_WI = Eigen::Vector3d(s_imu->linear_acceleration.x, s_imu->linear_acceleration.y, s_imu->linear_acceleration.z);
+    input.I_w_WI = Eigen::Vector3d(s_imu->angular_velocity.x, s_imu->angular_velocity.y, s_imu->angular_velocity.z);
+    imuBuffer.push_back(input);
   }
 
-  ROS_INFO_STREAM("Finished collecting data. " << imuBuffer_.size() << " measurements");
+  RCLCPP_INFO_STREAM(get_logger(), "Finished collecting data. " << imuBuffer.size() << " measurements");
 
   // Compute Allan Variance here
-  if(!imuBuffer_.empty()) {
-    allanVariance();
-  } else {
-    ROS_ERROR("No IMU messages to process, is your topic right?");
+  if (!imuBuffer.empty()) {
+    std::string imu_output_file = declare_parameter("output_file", "");
+    av_output_ = std::ofstream(imu_output_file.c_str(), std::ofstream::out);
+    allanVariance(imuBuffer);
+    av_output_.close();
+  }
+  else {
+    RCLCPP_ERROR(get_logger(), "No IMU messages to process, is your topic right?");
   }
 }
 
-void AllanVarianceComputor::closeOutputs() { av_output_.close(); }
-
-void AllanVarianceComputor::allanVariance() {
-
+void AllanVarianceComputor::allanVariance(const EigenVector<ImuMeasurement> & imuBuffer)
+{
   std::mutex mtx;
-  bool stop_early = false;
-  std::map<int,std::vector<std::vector<double>>> averages_map;
+  std::map<int, std::vector<std::vector<double>>> averages_map;
 
   // Range we will sample from (0.1s to 1000s)
   int period_min = 1;
@@ -133,34 +74,25 @@ void AllanVarianceComputor::allanVariance() {
   // Overlapping method
   #pragma omp parallel for
   for (int period = period_min; period < period_max; period++) {
-
-    if (!nh_.ok() || stop_early) {
-      stop_early = true;
-      continue;
-    }
-
-    std::vector<std::vector<double>> averages;
-    double period_time = period * 0.1; // Sampling periods from 0.1s to 1000s
-
-    int max_bin_size = period_time * measure_rate_;
-    int overlap = floor(max_bin_size * overlap_);
-
-    std::vector<double> current_average = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    double period_time = period * 0.1;  // Sampling periods from 0.1s to 1000s
+    int max_bin_size = period_time * imu_rate_;
+    int overlap = std::floor(max_bin_size * overlap_);
 
     // Compute Averages
-    for (int j = 0; j < ((int)imuBuffer_.size() - max_bin_size); j += (max_bin_size - overlap)) {
+    std::vector<std::vector<double>> averages;
+    for (int j = 0; j < ((int)imuBuffer.size() - max_bin_size); j += (max_bin_size - overlap)) {
+      std::vector<double> current_average = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
       // get average for current bin
       for (int m = 0; m < max_bin_size; m++) {
-        // ROS_INFO_STREAM("j + m: " << j + m);
         // // Acceleration
-        current_average[0] += imuBuffer_[j + m].I_a_WI[0];
-        current_average[1] += imuBuffer_[j + m].I_a_WI[1];
-        current_average[2] += imuBuffer_[j + m].I_a_WI[2];
+        current_average[0] += imuBuffer[j + m].I_a_WI[0];
+        current_average[1] += imuBuffer[j + m].I_a_WI[1];
+        current_average[2] += imuBuffer[j + m].I_a_WI[2];
 
         // Gyro - assumes measurements in radians and convert to degrees
-        current_average[3] += imuBuffer_[j + m].I_w_WI[0] * 180 / M_PI;
-        current_average[4] += imuBuffer_[j + m].I_w_WI[1] * 180 / M_PI;
-        current_average[5] += imuBuffer_[j + m].I_w_WI[2] * 180 / M_PI;
+        current_average[3] += imuBuffer[j + m].I_w_WI[0] * 180 / M_PI; // TODO
+        current_average[4] += imuBuffer[j + m].I_w_WI[1] * 180 / M_PI;
+        current_average[5] += imuBuffer[j + m].I_w_WI[2] * 180 / M_PI;
       }
 
       current_average[0] /= max_bin_size;
@@ -169,35 +101,22 @@ void AllanVarianceComputor::allanVariance() {
       current_average[3] /= max_bin_size;
       current_average[4] /= max_bin_size;
       current_average[5] /= max_bin_size;
-
       averages.push_back(current_average);
-      current_average = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     }
-
 
     {
       std::lock_guard<std::mutex> lck(mtx);
       int num_averages = averages.size();
-      ROS_INFO_STREAM("Computed " << num_averages << " averages for period " << period_time
-                      << " (" << (10000 - averages_map.size()) << " left)");
-      averages_map.insert({period, averages});
+      RCLCPP_INFO_STREAM(get_logger(), "Computed " << num_averages << " averages for period " << period_time << " (" << (10000 - averages_map.size()) << " left)");
+      averages_map[period] = averages;
     }
   }
 
-  if(!nh_.ok() || stop_early) {
-    ROS_ERROR_STREAM("Stop requested, stopping calculation!");
-    return;
-  }
-
-
-  std::vector<std::vector<double>> allan_variances;
   for (int period = period_min; period < period_max; period++) {
-
-    std::vector<std::vector<double>> averages = averages_map.at(period);
-    double period_time = period * 0.1; // Sampling periods from 0.1s to 1000s
+    const std::vector<std::vector<double>> & averages = averages_map.at(period);
+    double period_time = period * 0.1;  // Sampling periods from 0.1s to 1000s
     int num_averages = averages.size();
-    ROS_INFO_STREAM("Computed " << num_averages << " bins for sampling period " << period_time << " out of "
-                                << imuBuffer_.size() << " measurements.");
+    RCLCPP_INFO_STREAM(get_logger(), "Computed " << num_averages << " bins for sampling period " << period_time << " out of " << imuBuffer.size() << " measurements.");
 
     // Compute Allan Variance
     std::vector<double> allan_variance = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
@@ -210,31 +129,20 @@ void AllanVarianceComputor::allanVariance() {
       allan_variance[5] += std::pow(averages[k + 1][5] - averages[k][5], 2);
     }
     std::vector<double> avar = {
-        allan_variance[0] / (2 * (num_averages - 1)), allan_variance[1] / (2 * (num_averages - 1)),
-        allan_variance[2] / (2 * (num_averages - 1)), allan_variance[3] / (2 * (num_averages - 1)),
-        allan_variance[4] / (2 * (num_averages - 1)), allan_variance[5] / (2 * (num_averages - 1))};
+      allan_variance[0] / (2 * (num_averages - 1)), allan_variance[1] / (2 * (num_averages - 1)), allan_variance[2] / (2 * (num_averages - 1)),
+      allan_variance[3] / (2 * (num_averages - 1)), allan_variance[4] / (2 * (num_averages - 1)), allan_variance[5] / (2 * (num_averages - 1))};
 
     std::vector<double> allan_deviation = {std::sqrt(avar[0]), std::sqrt(avar[1]), std::sqrt(avar[2]),
-                                           std::sqrt(avar[3]), std::sqrt(avar[4]), std::sqrt(avar[5])};
+      std::sqrt(avar[3]), std::sqrt(avar[4]), std::sqrt(avar[5])};
 
     writeAllanDeviation(allan_deviation, period_time);
-
-    allan_variances.push_back(avar);
-
   }
-
-
 }
 
-void AllanVarianceComputor::writeAllanDeviation(std::vector<double> variance, double period) {
-  aVRecorder_.period = period;
-  aVRecorder_.accX = variance[0];
-  aVRecorder_.accY = variance[1];
-  aVRecorder_.accZ = variance[2];
-  aVRecorder_.gyroX = variance[3];
-  aVRecorder_.gyroY = variance[4];
-  aVRecorder_.gyroZ = variance[5];
-  aVRecorder_.writeOnFile(av_output_);
+void AllanVarianceComputor::writeAllanDeviation(const std::vector<double> & variance, double period)
+{
+  av_output_ << std::setprecision(19) << period << std::setprecision(7) << " " << variance[0] << " " << variance[1] << " " << variance[2] << " "
+    << variance[3] << " " << variance[4] << " " << variance[5] << " " << std::endl;
 }
 
 }  // namespace allan_variance_ros
