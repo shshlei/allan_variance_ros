@@ -2,11 +2,6 @@
 ## ROS2 package which loads a rosbag of IMU data and computes Allan Variance parameters
 The purpose of this tool is to read a long sequence of IMU data and compute the Angle Random Walk (ARW), Bias Instability and Gyro Random Walk for the gyroscope as well as Velocity Random Walk (VRW), Bias Instability and Accel Random Walk for the accelerometer.
 
-While there are many open source tools which do the same thing, this package has the following features:
-
-- Fully ROS compatable. Simply record a `rosbag` and provide it as input. No conversion required.
-- Written in C++ making use of rosbag::View means the `rosbag` is processed at maximum speed. No need to play back the bag file.
-
 ## Author
 
 [Russell Buchanan](https://raabuchanan.com/)
